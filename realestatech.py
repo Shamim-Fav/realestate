@@ -18,7 +18,7 @@ st.set_page_config(
 )
 
 class HomegateExtractor:
-    def __init__(self, urls, proxies=None, max_workers=10, max_retries=2):
+    def __init__(self, urls, proxies=None, max_workers=1, max_retries=2):
         self.urls = urls
         self.proxies = proxies if proxies else []
         self.max_workers = max_workers
