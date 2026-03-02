@@ -429,8 +429,8 @@ if urls:
             st.error("❌ No data was extracted successfully!")
             
 else:
-    # Welcome message
-    st.markdown("""
+    # Welcome message - using a variable to avoid triple quote issues
+    welcome_text = """
     ### 👋 Welcome!
     
     This tool extracts agency data directly from Homegate.ch URLs and provides an Excel file.
