@@ -1,123 +1,228 @@
 import streamlit as st
 import pandas as pd
 from curl_cffi import requests
-import time
 import random
-import json
+import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from datetime import datetime
 
-# --- Configuration & UI ---
-st.set_page_config(page_title="Swiss Real Estate Scraper", layout="wide")
+st.set_page_config(page_title="Advanced Scraper", layout="wide")
+st.title("🚀 Advanced Proxy + Captcha Aware Scraper → Excel")
 
-st.title("🏘️ Swiss Real Estate HTML to Excel")
-st.markdown("""
-- **No Proxy Mode**: Uses local IP with Chrome 120 impersonation.
-- **Excel Output**: All data (including 'anti-captcha' pages) saved in one file.
-- **Easy Download**: Get your results in one click.
-""")
+# -----------------------------
+# Helper Functions
+# -----------------------------
 
-# --- Scraper Logic ---
-class StreamlitScraper:
-    def __init__(self, urls, delay_min, delay_max):
-        self.urls = urls
-        self.delay_min = delay_min
-        self.delay_max = delay_max
-        self.results = []
+def check_for_captcha(html):
+    indicators = [
+        "captcha","recaptcha","cf-challenge","cf-ray",
+        "access denied","robot check","cloudflare",
+        "attention required","security check"
+    ]
+    html = html.lower()
+    return any(word in html for word in indicators)
 
-    def check_for_captcha(self, html):
-        indicators = ['captcha', 'recaptcha', 'cf-challenge', 'turnstile', 'robot check', 'access denied']
-        return any(x in html.lower() for x in indicators)
+def check_for_gone(html):
+    indicators = [
+        "410 gone","404 not found","no longer available",
+        "has been removed","does not exist"
+    ]
+    html = html.lower()
+    return any(word in html for word in indicators)
 
-    def run(self):
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        # Use a session for better performance
-        with requests.Session() as s:
-            for i, url in enumerate(self.urls):
-                status_text.text(f"Processing {i+1}/{len(self.urls)}: {url}")
-                
-                row = {
-                    "URL": url,
-                    "Status": "Pending",
-                    "Status_Code": None,
-                    "Timestamp": datetime.now().strftime("%H:%M:%S"),
-                    "Is_Captcha_Page": False,
-                    "Full_HTML": ""
+def parse_proxies(proxy_text):
+    proxies = []
+    for line in proxy_text.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            if "://" in line:
+                proxies.append(line)
+            else:
+                parts = line.split(":")
+                if len(parts) == 4:
+                    host, port, user, pwd = parts
+                    proxies.append(f"http://{user}:{pwd}@{host}:{port}")
+                elif len(parts) == 2:
+                    host, port = parts
+                    proxies.append(f"http://{host}:{port}")
+    return proxies
+
+# -----------------------------
+# UI INPUTS
+# -----------------------------
+
+uploaded_urls = st.file_uploader("Upload URLs.txt", type=["txt"])
+uploaded_proxies = st.file_uploader("Upload proxies.txt (optional)", type=["txt"])
+
+col1, col2, col3 = st.columns(3)
+max_workers = col1.number_input("Threads", 1, 50, 5)
+max_retries = col2.number_input("Max Retries", 1, 5, 2)
+proxy_rotate = col3.checkbox("Enable Proxy Rotation", True)
+
+start_btn = st.button("Start Scraping")
+
+# -----------------------------
+# MAIN LOGIC
+# -----------------------------
+
+if uploaded_urls and start_btn:
+
+    urls = uploaded_urls.read().decode("utf-8").splitlines()
+    urls = [u.strip() for u in urls if u.strip()]
+    total_urls = len(urls)
+
+    proxies = []
+    if uploaded_proxies:
+        proxy_text = uploaded_proxies.read().decode("utf-8")
+        proxies = parse_proxies(proxy_text)
+
+    proxy_index = 0
+    proxy_lock = threading.Lock()
+    bad_proxies = set()
+    proxy_fail_count = {}
+    max_fail_per_proxy = 3
+
+    stats = {
+        "success": 0,
+        "failed": 0,
+        "gone": 0,
+        "captcha": 0,
+        "rate_limited": 0,
+        "proxy_switches": 0
+    }
+
+    results = []
+    lock = threading.Lock()
+
+    progress_bar = st.progress(0)
+    status_box = st.empty()
+
+    def get_next_proxy():
+        nonlocal proxy_index
+        if not proxies:
+            return None
+        with proxy_lock:
+            proxy = proxies[proxy_index % len(proxies)]
+            proxy_index += 1
+            stats["proxy_switches"] += 1
+            return proxy
+
+    def scrape(url):
+
+        local_result = {
+            "URL": url,
+            "Status": "Failed",
+            "Status Code": None,
+            "Proxy Used": None,
+            "Content Length": 0,
+            "Timestamp": datetime.now()
+        }
+
+        for attempt in range(max_retries):
+
+            proxy_url = get_next_proxy() if proxy_rotate else None
+            proxy_dict = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+
+            try:
+                headers = {
+                    "User-Agent": random.choice([
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+                        "Mozilla/5.0 (X11; Linux x86_64)"
+                    ])
                 }
 
-                try:
-                    # Chrome 120 Impersonation
-                    resp = s.get(
-                        url, 
-                        impersonate="chrome120", 
-                        timeout=30,
-                        verify=False
-                    )
-                    
-                    row["Status_Code"] = resp.status_code
-                    row["Full_HTML"] = resp.text
-                    
-                    if resp.status_code == 200:
-                        row["Status"] = "Success"
-                        if self.check_for_captcha(resp.text):
-                            row["Is_Captcha_Page"] = True
-                    elif resp.status_code == 410:
-                        row["Status"] = "Gone (410)"
-                    else:
-                        row["Status"] = f"HTTP Error {resp.status_code}"
+                time.sleep(random.uniform(1,2))
 
-                except Exception as e:
-                    row["Status"] = "Failed"
-                    row["Full_HTML"] = str(e)
+                response = requests.get(
+                    url,
+                    impersonate="chrome120",
+                    timeout=30,
+                    headers=headers,
+                    proxies=proxy_dict,
+                    verify=False
+                )
 
-                self.results.append(row)
-                progress_bar.progress((i + 1) / len(self.urls))
-                
-                # Human-like delay (Since no proxy is used)
-                if i < len(self.urls) - 1:
-                    time.sleep(random.uniform(self.delay_min, self.delay_max))
-                    
-        return pd.DataFrame(self.results)
+                local_result["Status Code"] = response.status_code
+                local_result["Proxy Used"] = proxy_url
 
-# --- Sidebar Controls ---
-st.sidebar.header("Scraper Settings")
-d_min = st.sidebar.slider("Min Delay (sec)", 0.5, 3.0, 1.0)
-d_max = st.sidebar.slider("Max Delay (sec)", 1.5, 10.0, 3.0)
+                if response.status_code == 200:
 
-# --- Main App ---
-uploaded_file = st.file_uploader("Upload URLs (.txt)", type=['txt'])
+                    if check_for_gone(response.text):
+                        local_result["Status"] = "Content Gone"
+                        stats["gone"] += 1
+                        break
 
-if uploaded_file:
-    content = uploaded_file.read().decode("utf-8")
-    url_list = [line.strip() for line in content.split('\n') if line.strip()]
-    st.success(f"Loaded {len(url_list)} URLs")
+                    if check_for_captcha(response.text):
+                        local_result["Status"] = "Captcha"
+                        stats["captcha"] += 1
+                        continue
 
-    if st.button("🚀 Start Scraping"):
-        scraper = StreamlitScraper(url_list, d_min, d_max)
-        df_final = scraper.run()
-        
-        st.divider()
-        st.subheader("Results Preview")
-        # Don't show the massive HTML column in the browser preview
-        st.dataframe(df_final.drop(columns=["Full_HTML"]).head(20))
+                    local_result["Status"] = "Success"
+                    local_result["Content Length"] = len(response.text)
+                    stats["success"] += 1
+                    break
 
-        # --- Excel Export Logic ---
-        output = BytesIO()
-        # Use 'xlsxwriter' to handle large HTML strings in cells
-        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-            df_final.to_excel(writer, index=False, sheet_name='Data')
-            
-            # Auto-adjust column width for readability
-            workbook  = writer.book
-            worksheet = writer.sheets['Data']
-            worksheet.set_column('A:A', 40) # URLs
-            worksheet.set_column('F:F', 50) # HTML Content
+                elif response.status_code == 410:
+                    local_result["Status"] = "Gone (410)"
+                    stats["gone"] += 1
+                    break
 
-        st.download_button(
-            label="📥 Download Excel File",
-            data=output.getvalue(),
-            file_name=f"homegate_results_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+                elif response.status_code in [403,429,503]:
+                    stats["rate_limited"] += 1
+                    continue
+
+                else:
+                    local_result["Status"] = f"HTTP {response.status_code}"
+
+            except Exception as e:
+                local_result["Status"] = str(e)
+
+        if local_result["Status"] not in ["Success","Gone (410)","Content Gone"]:
+            stats["failed"] += 1
+
+        return local_result
+
+    # Threaded Execution
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(scrape, url): url for url in urls}
+
+        completed = 0
+        for future in as_completed(futures):
+            result = future.result()
+            results.append(result)
+            completed += 1
+
+            progress_bar.progress(completed / total_urls)
+
+            status_box.write(
+                f"""
+                ✅ Success: {stats['success']}  
+                ❌ Failed: {stats['failed']}  
+                📪 Gone: {stats['gone']}  
+                ⚠️ Captcha: {stats['captcha']}  
+                🚫 Rate Limited: {stats['rate_limited']}  
+                🔄 Proxy Switches: {stats['proxy_switches']}  
+                """
+            )
+
+    # -----------------------------
+    # CREATE EXCEL
+    # -----------------------------
+
+    df = pd.DataFrame(results)
+
+    output = BytesIO()
+    df.to_excel(output, index=False)
+    output.seek(0)
+
+    st.success("🎉 Scraping Completed!")
+
+    st.download_button(
+        label="Download Final Excel File",
+        data=output,
+        file_name="full_scraper_results.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
