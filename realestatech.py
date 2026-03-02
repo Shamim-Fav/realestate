@@ -20,7 +20,7 @@ st.set_page_config(
 )
 
 # Custom CSS
-st.markdown("""
+st.markdown(""
 <style>
     .stProgress > div > div > div > div {
         background-color: #00cc66;
@@ -40,7 +40,7 @@ st.markdown("""
         color: #856404;
     }
 </style>
-""", unsafe_allow_html=True)
+"", unsafe_allow_html=True)
 
 class HomegateScraper:
     def __init__(self, urls, proxies=None, max_retries=2):
