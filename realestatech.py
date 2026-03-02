@@ -7,8 +7,6 @@ import re
 import pandas as pd
 from datetime import datetime
 import io
-import concurrent.futures
-import threading
 
 # Set page config
 st.set_page_config(
@@ -18,18 +16,15 @@ st.set_page_config(
 )
 
 class HomegateExtractor:
-    def __init__(self, urls, proxies=None, max_workers=1, max_retries=2):
+    def __init__(self, urls, proxies=None, max_retries=2, delay_range=(2, 4)):
         self.urls = urls
         self.proxies = proxies if proxies else []
-        self.max_workers = max_workers
         self.max_retries = max_retries
+        self.delay_range = delay_range
         self.total_urls = len(urls)
         self.proxy_index = 0
-        self.proxy_lock = threading.Lock()
         self.results = []
         self.failed_urls = []
-        self.results_lock = threading.Lock()
-        self.failed_lock = threading.Lock()
         self.stats = {
             'success': 0,
             'failed': 0,
@@ -37,15 +32,13 @@ class HomegateExtractor:
             'gone_count': 0,
             'rate_limited': 0
         }
-        self.stats_lock = threading.Lock()
         
     def get_next_proxy(self):
         if not self.proxies:
             return None
-        with self.proxy_lock:
-            proxy = self.proxies[self.proxy_index]
-            self.proxy_index = (self.proxy_index + 1) % len(self.proxies)
-            return proxy
+        proxy = self.proxies[self.proxy_index]
+        self.proxy_index = (self.proxy_index + 1) % len(self.proxies)
+        return proxy
     
     def check_for_captcha(self, html_content):
         captcha_indicators = [
@@ -171,7 +164,8 @@ class HomegateExtractor:
                     'Upgrade-Insecure-Requests': '1',
                 }
                 
-                time.sleep(random.uniform(0.5, 1.5))
+                # Random delay between requests to be gentle
+                time.sleep(random.uniform(self.delay_range[0], self.delay_range[1]))
                 
                 response = requests.get(
                     url, 
@@ -183,25 +177,21 @@ class HomegateExtractor:
                 )
                 
                 if response.status_code == 410:
-                    with self.stats_lock:
-                        self.stats['gone_count'] += 1
+                    self.stats['gone_count'] += 1
                     return None, "URL is gone (410)"
                 
                 if response.status_code != 200:
                     if response.status_code in [403, 429, 503]:
-                        with self.stats_lock:
-                            self.stats['rate_limited'] += 1
+                        self.stats['rate_limited'] += 1
                     return None, f"HTTP {response.status_code}"
                 
                 if response.status_code == 200:
                     if self.check_for_gone(response.text):
-                        with self.stats_lock:
-                            self.stats['gone_count'] += 1
+                        self.stats['gone_count'] += 1
                         return None, "Content appears to be gone"
                     
                     if self.check_for_captcha(response.text):
-                        with self.stats_lock:
-                            self.stats['captcha_detected'] += 1
+                        self.stats['captcha_detected'] += 1
                     
                     company_data = self.extract_from_html(response.text, url)
                     if company_data:
@@ -212,36 +202,24 @@ class HomegateExtractor:
             except Exception as e:
                 if attempt == self.max_retries - 1:
                     return None, str(e)[:100]
-                time.sleep(random.uniform(1, 2))
+                time.sleep(random.uniform(2, 3))
         
         return None, "Max retries exceeded"
     
-    def process_url(self, url):
-        data, error = self.download_page(url)
-        
-        if data:
-            with self.results_lock:
-                self.results.append(data)
-            with self.stats_lock:
-                self.stats['success'] += 1
-            return True, url
-        else:
-            with self.failed_lock:
-                self.failed_urls.append({'url': url, 'error': error})
-            with self.stats_lock:
-                self.stats['failed'] += 1
-            return False, url
-    
     def run(self, progress_callback=None):
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            future_to_url = {executor.submit(self.process_url, url): url for url in self.urls}
-            completed = 0
+        """Run sequentially - one URL at a time"""
+        for i, url in enumerate(self.urls):
+            data, error = self.download_page(url)
             
-            for future in concurrent.futures.as_completed(future_to_url):
-                completed += 1
-                success, url = future.result()
-                if progress_callback:
-                    progress_callback(completed, self.total_urls, url, success)
+            if data:
+                self.results.append(data)
+                self.stats['success'] += 1
+            else:
+                self.failed_urls.append({'url': url, 'error': error})
+                self.stats['failed'] += 1
+            
+            if progress_callback:
+                progress_callback(i + 1, self.total_urls, url, data is not None)
         
         return self.results, self.failed_urls, self.stats
 
@@ -252,9 +230,6 @@ st.markdown("Extract agency data directly to Excel - no HTML files saved")
 # Sidebar
 with st.sidebar:
     st.header("⚙️ Settings")
-    
-    # Worker threads
-    max_workers = st.slider("Number of threads:", 1, 20, 10)
     
     # Input method
     input_method = st.radio(
@@ -299,6 +274,7 @@ with st.sidebar:
     
     with st.expander("🔧 Advanced"):
         max_retries = st.slider("Max retries per URL:", 1, 5, 2)
+        delay = st.slider("Delay between requests (seconds):", 1.0, 10.0, 3.0, 0.5)
 
 # Main content
 if urls:
@@ -318,8 +294,8 @@ if urls:
         extractor = HomegateExtractor(
             urls=urls,
             proxies=proxies if proxy_option == "Use proxies" else [],
-            max_workers=max_workers,
-            max_retries=max_retries
+            max_retries=max_retries,
+            delay_range=(delay-0.5, delay+0.5)
         )
         
         progress_bar = st.progress(0)
@@ -329,7 +305,7 @@ if urls:
         
         def update_progress(current, total, current_url, success):
             progress_bar.progress(current / total)
-            status_text.text(f"Processing: {current}/{total}")
+            status_text.text(f"Processing: {current}/{total} (delay: {delay}s)")
             stats_text.markdown(f"""
             ✅ Success: {extractor.stats['success']} | ❌ Failed: {extractor.stats['failed']} | 📪 Gone: {extractor.stats['gone_count']} | ⚠️ Captcha: {extractor.stats['captcha_detected']}
             """)
@@ -408,24 +384,22 @@ else:
     st.markdown("This tool extracts agency data directly from Homegate.ch URLs and provides an Excel file.")
     st.markdown("")
     st.markdown("**Features:**")
-    st.markdown("- Multi-threaded extraction (up to 20 threads)")
+    st.markdown("- Sequential processing (gentle on servers)")
+    st.markdown("- Adjustable delay between requests")
     st.markdown("- Proxy support with rotation")
     st.markdown("- Tracks captcha, gone URLs, and rate limiting")
     st.markdown("- Direct Excel download - no files saved on server")
     st.markdown("")
     st.markdown("**How to use:**")
     st.markdown("1. Paste your URLs or upload a text file")
-    st.markdown("2. Configure proxy settings (optional)")
-    st.markdown("3. Adjust thread count for speed")
+    st.markdown("2. Add your proxy: `http://okbqhrtv-rotate:aa0kiwxlrvqk@p.webshare.io:80/`")
+    st.markdown("3. Adjust delay if needed (3-5 seconds recommended)")
     st.markdown("4. Click 'Start Extraction'")
     st.markdown("5. Download your Excel file")
     st.markdown("")
     st.markdown("**Example URL:**")
     st.code("https://www.homegate.ch/agency/abc123")
     st.code("https://www.homegate.ch/agency/xyz789/company-name")
-    st.markdown("")
-    st.markdown("**Proxy example:**")
-    st.code("http://okbqhrtv-rotate:aa0kiwxlrvqk@p.webshare.io:80/")
 
 st.markdown("---")
-st.markdown("⚡ Powered by multi-threaded extraction")
+st.markdown("⚡ Sequential processing - gentle on servers")
