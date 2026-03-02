@@ -1,177 +1,106 @@
 import streamlit as st
-import pandas as pd
-from curl_cffi import requests
-import random
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from io import BytesIO
+import random
+from curl_cffi import requests
 from datetime import datetime
+import pandas as pd
 
-st.set_page_config(page_title="Advanced Scraper", layout="wide")
-st.title("🚀 Fast Scraper → Excel (No Proxy)")
+st.title("Homegate URL Checker (Safe Mode)")
 
-# -----------------------------
-# Helper Functions
-# -----------------------------
+uploaded_file = st.file_uploader("Upload URL file (.txt)", type=["txt"])
 
-def check_for_captcha(html):
-    indicators = [
-        "captcha","recaptcha","cf-challenge",
-        "access denied","robot check",
-        "cloudflare","attention required"
-    ]
-    html = html.lower()
-    return any(word in html for word in indicators)
-
-def check_for_gone(html):
-    indicators = [
-        "410 gone","404 not found",
-        "no longer available",
-        "has been removed","does not exist"
-    ]
-    html = html.lower()
-    return any(word in html for word in indicators)
-
-# -----------------------------
-# UI
-# -----------------------------
-
-uploaded_urls = st.file_uploader("Upload URLs.txt", type=["txt"])
-
-col1, col2 = st.columns(2)
-max_workers = col1.number_input("Threads", 1, 50, 5)
-max_retries = col2.number_input("Max Retries", 1, 5, 2)
-
-start_btn = st.button("Start Scraping")
-
-# -----------------------------
-# MAIN LOGIC
-# -----------------------------
-
-if uploaded_urls and start_btn:
-
-    urls = uploaded_urls.read().decode("utf-8").splitlines()
+if uploaded_file:
+    urls = uploaded_file.read().decode("utf-8").splitlines()
     urls = [u.strip() for u in urls if u.strip()]
-    total_urls = len(urls)
 
-    stats = {
-        "success": 0,
-        "failed": 0,
-        "gone": 0,
-        "captcha": 0,
-        "rate_limited": 0
-    }
+    if st.button("Start Checking"):
 
-    results = []
+        results = []
+        progress = st.progress(0)
 
-    progress_bar = st.progress(0)
-    status_box = st.empty()
-
-    def scrape(url):
-
-        result = {
-            "URL": url,
-            "Status": "Failed",
-            "Status Code": None,
-            "Content Length": 0,
-            "Timestamp": datetime.now()
+        stats = {
+            "processed": 0,
+            "success": 0,
+            "failed": 0,
+            "captcha": 0
         }
 
-        for attempt in range(max_retries):
-            try:
-                headers = {
-                    "User-Agent": random.choice([
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
-                        "Mozilla/5.0 (X11; Linux x86_64)"
-                    ])
+        headers = {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+        }
+
+        for i, url in enumerate(urls):
+
+            max_retries = 3
+            result = None
+
+            for attempt in range(max_retries):
+                try:
+                    # Human-like delay
+                    time.sleep(random.uniform(1, 3))
+
+                    response = requests.get(
+                        url,
+                        headers=headers,
+                        impersonate="chrome120",
+                        timeout=30,
+                        verify=False
+                    )
+
+                    status_code = response.status_code
+                    content_length = len(response.text)
+
+                    if "captcha" in response.text.lower():
+                        status = "Captcha"
+                        stats["captcha"] += 1
+                    elif status_code == 200:
+                        status = "Success"
+                        stats["success"] += 1
+                    else:
+                        status = "Failed"
+                        stats["failed"] += 1
+
+                    result = {
+                        "URL": url,
+                        "Status": status,
+                        "Status Code": status_code,
+                        "Content Length": content_length,
+                        "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    }
+
+                    break
+
+                except Exception:
+                    time.sleep(2)
+
+            if result is None:
+                stats["failed"] += 1
+                result = {
+                    "URL": url,
+                    "Status": "Error",
+                    "Status Code": 0,
+                    "Content Length": 0,
+                    "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 }
 
-                time.sleep(random.uniform(1,2))
+            results.append(result)
+            stats["processed"] += 1
 
-                response = requests.get(
-                    url,
-                    impersonate="chrome120",
-                    timeout=30,
-                    headers=headers,
-                    verify=False
-                )
+            progress.progress((i + 1) / len(urls))
 
-                result["Status Code"] = response.status_code
+        df = pd.DataFrame(results)
 
-                if response.status_code == 200:
+        st.success("Finished!")
+        st.write(stats)
+        st.dataframe(df)
 
-                    if check_for_gone(response.text):
-                        result["Status"] = "Content Gone"
-                        stats["gone"] += 1
-                        break
-
-                    if check_for_captcha(response.text):
-                        result["Status"] = "Captcha"
-                        stats["captcha"] += 1
-                        continue
-
-                    result["Status"] = "Success"
-                    result["Content Length"] = len(response.text)
-                    stats["success"] += 1
-                    break
-
-                elif response.status_code == 410:
-                    result["Status"] = "Gone (410)"
-                    stats["gone"] += 1
-                    break
-
-                elif response.status_code in [403,429,503]:
-                    stats["rate_limited"] += 1
-                    continue
-
-                else:
-                    result["Status"] = f"HTTP {response.status_code}"
-
-            except Exception as e:
-                result["Status"] = str(e)
-
-        if result["Status"] not in ["Success","Gone (410)","Content Gone"]:
-            stats["failed"] += 1
-
-        return result
-
-    # Threaded Execution
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(scrape, url): url for url in urls}
-
-        completed = 0
-        for future in as_completed(futures):
-            results.append(future.result())
-            completed += 1
-
-            progress_bar.progress(completed / total_urls)
-
-            status_box.write(
-                f"""
-                ✅ Success: {stats['success']}  
-                ❌ Failed: {stats['failed']}  
-                📪 Gone: {stats['gone']}  
-                ⚠️ Captcha: {stats['captcha']}  
-                🚫 Rate Limited: {stats['rate_limited']}  
-                """
-            )
-
-    # -----------------------------
-    # CREATE EXCEL
-    # -----------------------------
-
-    df = pd.DataFrame(results)
-
-    output = BytesIO()
-    df.to_excel(output, index=False)
-    output.seek(0)
-
-    st.success("🎉 Scraping Completed!")
-
-    st.download_button(
-        label="Download Final Excel File",
-        data=output,
-        file_name="scraper_results.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
+        csv = df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download CSV",
+            csv,
+            "results.csv",
+            "text/csv"
+        )
