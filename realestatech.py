@@ -7,6 +7,8 @@ import re
 import pandas as pd
 from datetime import datetime
 import io
+import concurrent.futures
+import threading
 
 # Set page config
 st.set_page_config(
@@ -16,14 +18,18 @@ st.set_page_config(
 )
 
 class HomegateExtractor:
-    def __init__(self, urls, proxies=None, max_retries=2):
+    def __init__(self, urls, proxies=None, max_workers=10, max_retries=2):
         self.urls = urls
         self.proxies = proxies if proxies else []
+        self.max_workers = max_workers
         self.max_retries = max_retries
         self.total_urls = len(urls)
         self.proxy_index = 0
+        self.proxy_lock = threading.Lock()
         self.results = []
         self.failed_urls = []
+        self.results_lock = threading.Lock()
+        self.failed_lock = threading.Lock()
         self.stats = {
             'success': 0,
             'failed': 0,
@@ -31,13 +37,15 @@ class HomegateExtractor:
             'gone_count': 0,
             'rate_limited': 0
         }
+        self.stats_lock = threading.Lock()
         
     def get_next_proxy(self):
         if not self.proxies:
             return None
-        proxy = self.proxies[self.proxy_index]
-        self.proxy_index = (self.proxy_index + 1) % len(self.proxies)
-        return proxy
+        with self.proxy_lock:
+            proxy = self.proxies[self.proxy_index]
+            self.proxy_index = (self.proxy_index + 1) % len(self.proxies)
+            return proxy
     
     def check_for_captcha(self, html_content):
         captcha_indicators = [
@@ -163,7 +171,7 @@ class HomegateExtractor:
                     'Upgrade-Insecure-Requests': '1',
                 }
                 
-                time.sleep(random.uniform(1, 3))
+                time.sleep(random.uniform(0.5, 1.5))
                 
                 response = requests.get(
                     url, 
@@ -175,21 +183,25 @@ class HomegateExtractor:
                 )
                 
                 if response.status_code == 410:
-                    self.stats['gone_count'] += 1
+                    with self.stats_lock:
+                        self.stats['gone_count'] += 1
                     return None, "URL is gone (410)"
                 
                 if response.status_code != 200:
                     if response.status_code in [403, 429, 503]:
-                        self.stats['rate_limited'] += 1
+                        with self.stats_lock:
+                            self.stats['rate_limited'] += 1
                     return None, f"HTTP {response.status_code}"
                 
                 if response.status_code == 200:
                     if self.check_for_gone(response.text):
-                        self.stats['gone_count'] += 1
+                        with self.stats_lock:
+                            self.stats['gone_count'] += 1
                         return None, "Content appears to be gone"
                     
                     if self.check_for_captcha(response.text):
-                        self.stats['captcha_detected'] += 1
+                        with self.stats_lock:
+                            self.stats['captcha_detected'] += 1
                     
                     company_data = self.extract_from_html(response.text, url)
                     if company_data:
@@ -200,23 +212,36 @@ class HomegateExtractor:
             except Exception as e:
                 if attempt == self.max_retries - 1:
                     return None, str(e)[:100]
-                time.sleep(random.uniform(2, 4))
+                time.sleep(random.uniform(1, 2))
         
         return None, "Max retries exceeded"
     
-    def run(self, progress_callback=None):
-        for i, url in enumerate(self.urls):
-            data, error = self.download_page(url)
-            
-            if data:
+    def process_url(self, url):
+        data, error = self.download_page(url)
+        
+        if data:
+            with self.results_lock:
                 self.results.append(data)
+            with self.stats_lock:
                 self.stats['success'] += 1
-            else:
+            return True, url
+        else:
+            with self.failed_lock:
                 self.failed_urls.append({'url': url, 'error': error})
+            with self.stats_lock:
                 self.stats['failed'] += 1
+            return False, url
+    
+    def run(self, progress_callback=None):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            future_to_url = {executor.submit(self.process_url, url): url for url in self.urls}
+            completed = 0
             
-            if progress_callback:
-                progress_callback(i + 1, self.total_urls, url, data is not None)
+            for future in concurrent.futures.as_completed(future_to_url):
+                completed += 1
+                success, url = future.result()
+                if progress_callback:
+                    progress_callback(completed, self.total_urls, url, success)
         
         return self.results, self.failed_urls, self.stats
 
@@ -228,6 +253,10 @@ st.markdown("Extract agency data directly to Excel - no HTML files saved")
 with st.sidebar:
     st.header("⚙️ Settings")
     
+    # Worker threads
+    max_workers = st.slider("Number of threads:", 1, 20, 10)
+    
+    # Input method
     input_method = st.radio(
         "Choose input method:",
         ["📝 Paste URLs", "📁 Upload file"]
@@ -252,11 +281,16 @@ with st.sidebar:
             urls = [u.strip() for u in content.split('\n') if u.strip()]
     
     st.header("🔌 Proxy Settings")
+    st.markdown("Example: `http://okbqhrtv-rotate:aa0kiwxlrvqk@p.webshare.io:80/`")
     proxy_option = st.radio("Proxy option:", ["No proxy", "Use proxies"])
     
     proxies = []
     if proxy_option == "Use proxies":
-        proxy_input = st.text_area("Enter proxies (one per line):", height=150)
+        proxy_input = st.text_area(
+            "Enter proxies (one per line):", 
+            height=100,
+            placeholder="http://user:pass@host:port"
+        )
         if proxy_input:
             for line in proxy_input.split('\n'):
                 line = line.strip()
@@ -284,6 +318,7 @@ if urls:
         extractor = HomegateExtractor(
             urls=urls,
             proxies=proxies if proxy_option == "Use proxies" else [],
+            max_workers=max_workers,
             max_retries=max_retries
         )
         
@@ -326,16 +361,12 @@ if urls:
         if results:
             df = pd.DataFrame(results)
             
-            columns = ['company_name', 'source_url', 'logo_url', 'phone', 'email', 'website',
-                      'address', 'agency_id', 'extract_method']
-            existing_cols = [col for col in columns if col in df.columns]
-            other_cols = [col for col in df.columns if col not in columns]
-            df = df[existing_cols + other_cols]
-            
+            # Create Excel file
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
                 df.to_excel(writer, index=False, sheet_name='Agencies')
                 
+                # Auto-adjust column widths
                 worksheet = writer.sheets['Agencies']
                 for column in worksheet.columns:
                     max_length = 0
@@ -361,53 +392,40 @@ if urls:
             )
             
             with st.expander("👁️ Preview Extracted Data"):
-                st.dataframe(df[['company_name', 'phone', 'email', 'website', 'extract_method']].head(10), use_container_width=True)
+                st.dataframe(df[['company_name', 'phone', 'email', 'website']].head(10), use_container_width=True)
             
             if failed:
                 with st.expander("❌ Failed URLs"):
                     failed_df = pd.DataFrame(failed)
                     st.dataframe(failed_df, use_container_width=True)
             
-            st.markdown("### 📊 Data Quality Summary")
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("Companies with Phone", df['phone'].notna().sum())
-            with col2:
-                st.metric("Companies with Email", df['email'].notna().sum())
-            with col3:
-                st.metric("Companies with Website", df['website'].notna().sum())
-            with col4:
-                st.metric("Companies with Logo", df['logo_url'].notna().sum())
-            
-            st.markdown("**Extraction Method:**")
-            method_counts = df['extract_method'].value_counts()
-            for method, count in method_counts.items():
-                st.markdown(f"- {method}: {count} ({count/len(df)*100:.1f}%)")
-            
         else:
             st.error("❌ No data was extracted successfully!")
             
 else:
-    # Using multiple small markdown calls instead of one big string
     st.markdown("### 👋 Welcome!")
     st.markdown("")
     st.markdown("This tool extracts agency data directly from Homegate.ch URLs and provides an Excel file.")
     st.markdown("")
     st.markdown("**Features:**")
-    st.markdown("- Same extraction logic as your original script")
-    st.markdown("- No HTML files saved - just the Excel output")
+    st.markdown("- Multi-threaded extraction (up to 20 threads)")
+    st.markdown("- Proxy support with rotation")
     st.markdown("- Tracks captcha, gone URLs, and rate limiting")
-    st.markdown("- Proxy support")
+    st.markdown("- Direct Excel download - no files saved on server")
     st.markdown("")
     st.markdown("**How to use:**")
     st.markdown("1. Paste your URLs or upload a text file")
     st.markdown("2. Configure proxy settings (optional)")
-    st.markdown("3. Click 'Start Extraction'")
-    st.markdown("4. Download your Excel file")
+    st.markdown("3. Adjust thread count for speed")
+    st.markdown("4. Click 'Start Extraction'")
+    st.markdown("5. Download your Excel file")
     st.markdown("")
     st.markdown("**Example URL:**")
     st.code("https://www.homegate.ch/agency/abc123")
     st.code("https://www.homegate.ch/agency/xyz789/company-name")
+    st.markdown("")
+    st.markdown("**Proxy example:**")
+    st.code("http://okbqhrtv-rotate:aa0kiwxlrvqk@p.webshare.io:80/")
 
 st.markdown("---")
-st.markdown("⚡ Powered by your original extraction logic")
+st.markdown("⚡ Powered by multi-threaded extraction")
