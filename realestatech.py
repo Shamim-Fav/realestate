@@ -448,7 +448,7 @@ if urls:
             st.error("❌ No data was extracted successfully!")
             
 else:
-    # Welcome message
+    # Welcome message - FIXED: properly closed triple quotes
     st.markdown("""
     ### 👋 Welcome!
     
