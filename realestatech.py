@@ -40,7 +40,6 @@ class HomegateExtractor:
         return proxy
     
     def check_for_captcha(self, html_content):
-        """Check if page contains captcha indicators - matching original"""
         captcha_indicators = [
             'captcha', 'recaptcha', 'cf-challenge', 'cf-browser-verification',
             'cf-ray', 'access denied', 'please verify', 'robot check',
@@ -56,7 +55,6 @@ class HomegateExtractor:
         return False
     
     def check_for_gone(self, html_content):
-        """Check if page indicates content is gone - matching original"""
         gone_indicators = [
             '410 gone', 'page not found', 'no longer available',
             'has been removed', 'does not exist', '404 not found',
@@ -70,9 +68,7 @@ class HomegateExtractor:
         return False
     
     def extract_from_html(self, html_content, url):
-        """Extract company data from HTML - matching original extractor exactly"""
         try:
-            # Try JSON extraction first
             pattern = r'window\.__INITIAL_STATE__\s*=\s*({.*?});'
             match = re.search(pattern, html_content, re.DOTALL)
             
@@ -81,7 +77,6 @@ class HomegateExtractor:
                 json_str = re.sub(r',\s*}', '}', json_str)
                 json_str = re.sub(r',\s*]', ']', json_str)
                 
-                # Find valid JSON end
                 stack = []
                 valid_end = 0
                 for i, char in enumerate(json_str):
@@ -124,7 +119,6 @@ class HomegateExtractor:
                         'extract_method': 'json'
                     }
             
-            # Fallback extraction - matching original
             name_match = re.search(r'<h1[^>]*>([^<]+)</h1>', html_content)
             phone_match = re.search(r'tel:([^"]+)"', html_content) or re.search(r'phone":\s*"([^"]+)"', html_content)
             email_match = re.search(r'mailto:([^"]+)"', html_content) or re.search(r'email":\s*"([^"]+)"', html_content)
@@ -133,7 +127,6 @@ class HomegateExtractor:
             logo_match = (re.search(r'<img[^>]*data-test="agencyLogoImage"[^>]*src="([^"]+)"', html_content) or 
                          re.search(r'<img[^>]*class="[^"]*agency-logo[^"]*"[^>]*src="([^"]+)"', html_content))
             
-            # Get filename for fallback name
             filename = url.split('/')[-1] if url.split('/')[-1] else 'index'
             
             return {
@@ -152,7 +145,6 @@ class HomegateExtractor:
             return None
     
     def download_page(self, url):
-        """Download and extract data - matching original logic"""
         for attempt in range(self.max_retries):
             proxy_url = self.get_next_proxy() if self.proxies else None
             proxy_dict = {"http": proxy_url, "https": proxy_url} if proxy_url else None
@@ -182,28 +174,23 @@ class HomegateExtractor:
                     verify=False
                 )
                 
-                # Handle 410 Gone
                 if response.status_code == 410:
                     self.stats['gone_count'] += 1
                     return None, "URL is gone (410)"
                 
-                # Handle other HTTP errors
                 if response.status_code != 200:
                     if response.status_code in [403, 429, 503]:
                         self.stats['rate_limited'] += 1
                     return None, f"HTTP {response.status_code}"
                 
                 if response.status_code == 200:
-                    # Check if content is gone
                     if self.check_for_gone(response.text):
                         self.stats['gone_count'] += 1
                         return None, "Content appears to be gone"
                     
-                    # Check for captcha (just for stats)
                     if self.check_for_captcha(response.text):
                         self.stats['captcha_detected'] += 1
                     
-                    # Extract data
                     company_data = self.extract_from_html(response.text, url)
                     if company_data:
                         return company_data, None
@@ -218,7 +205,6 @@ class HomegateExtractor:
         return None, "Max retries exceeded"
     
     def run(self, progress_callback=None):
-        """Run the extractor"""
         for i, url in enumerate(self.urls):
             data, error = self.download_page(url)
             
@@ -242,7 +228,6 @@ st.markdown("Extract agency data directly to Excel - no HTML files saved")
 with st.sidebar:
     st.header("⚙️ Settings")
     
-    # Input method
     input_method = st.radio(
         "Choose input method:",
         ["📝 Paste URLs", "📁 Upload file"]
@@ -260,35 +245,24 @@ with st.sidebar:
     else:
         uploaded_file = st.file_uploader(
             "Upload a text file with URLs",
-            type=['txt'],
-            help="Text file with one URL per line"
+            type=['txt']
         )
         if uploaded_file:
             content = uploaded_file.getvalue().decode('utf-8')
             urls = [u.strip() for u in content.split('\n') if u.strip()]
     
-    # Proxy settings
     st.header("🔌 Proxy Settings")
-    proxy_option = st.radio(
-        "Proxy option:",
-        ["No proxy", "Use proxies"]
-    )
+    proxy_option = st.radio("Proxy option:", ["No proxy", "Use proxies"])
     
     proxies = []
     if proxy_option == "Use proxies":
-        proxy_input = st.text_area(
-            "Enter proxies (one per line):",
-            height=150,
-            placeholder="http://user:pass@host:port\nhost:port:user:pass\nhost:port",
-            help="Supported formats:\n- http://user:pass@host:port\n- host:port:user:pass\n- host:port"
-        )
+        proxy_input = st.text_area("Enter proxies (one per line):", height=150)
         if proxy_input:
             for line in proxy_input.split('\n'):
                 line = line.strip()
                 if line and not line.startswith('#'):
                     proxies.append(line)
     
-    # Advanced settings
     with st.expander("🔧 Advanced"):
         max_retries = st.slider("Max retries per URL:", 1, 5, 2)
 
@@ -296,27 +270,23 @@ with st.sidebar:
 if urls:
     st.success(f"✅ Loaded {len(urls)} URLs")
     
-    # Sample of URLs
     with st.expander("📋 View URLs"):
         for url in urls[:5]:
             st.code(url)
         if len(urls) > 5:
             st.info(f"... and {len(urls) - 5} more")
     
-    # Start button
     col1, col2, col3 = st.columns([1, 1, 1])
     with col2:
         start_button = st.button("🚀 Start Extraction", type="primary", use_container_width=True)
     
     if start_button:
-        # Initialize extractor
         extractor = HomegateExtractor(
             urls=urls,
             proxies=proxies if proxy_option == "Use proxies" else [],
             max_retries=max_retries
         )
         
-        # Progress tracking
         progress_bar = st.progress(0)
         status_text = st.empty()
         stats_text = st.empty()
@@ -334,14 +304,12 @@ if urls:
                 else:
                     st.error(f"❌ {current_url[:80]}...")
         
-        # Run extractor
         with st.spinner("Extracting data..."):
             results, failed, stats = extractor.run(progress_callback=update_progress)
         
         progress_bar.progress(1.0)
         status_text.text("✅ Complete!")
         
-        # Show summary
         st.markdown("---")
         col1, col2, col3, col4, col5 = st.columns(5)
         with col1:
@@ -355,23 +323,19 @@ if urls:
         with col5:
             st.metric("Captcha", stats['captcha_detected'])
         
-        # Create Excel file
         if results:
             df = pd.DataFrame(results)
             
-            # Reorder columns to match original
             columns = ['company_name', 'source_url', 'logo_url', 'phone', 'email', 'website',
                       'address', 'agency_id', 'extract_method']
             existing_cols = [col for col in columns if col in df.columns]
             other_cols = [col for col in df.columns if col not in columns]
             df = df[existing_cols + other_cols]
             
-            # Create Excel file in memory
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
                 df.to_excel(writer, index=False, sheet_name='Agencies')
                 
-                # Auto-adjust column widths
                 worksheet = writer.sheets['Agencies']
                 for column in worksheet.columns:
                     max_length = 0
@@ -387,7 +351,6 @@ if urls:
             
             output.seek(0)
             
-            # Download button
             st.markdown("### 📥 Download Results")
             st.download_button(
                 label="📊 Download Excel File",
@@ -397,17 +360,14 @@ if urls:
                 use_container_width=True
             )
             
-            # Show data preview
             with st.expander("👁️ Preview Extracted Data"):
                 st.dataframe(df[['company_name', 'phone', 'email', 'website', 'extract_method']].head(10), use_container_width=True)
             
-            # Show failed URLs if any
             if failed:
                 with st.expander("❌ Failed URLs"):
                     failed_df = pd.DataFrame(failed)
                     st.dataframe(failed_df, use_container_width=True)
             
-            # Summary statistics
             st.markdown("### 📊 Data Quality Summary")
             col1, col2, col3, col4 = st.columns(4)
             with col1:
@@ -419,7 +379,6 @@ if urls:
             with col4:
                 st.metric("Companies with Logo", df['logo_url'].notna().sum())
             
-            # Extraction method breakdown
             st.markdown("**Extraction Method:**")
             method_counts = df['extract_method'].value_counts()
             for method, count in method_counts.items():
@@ -429,22 +388,26 @@ if urls:
             st.error("❌ No data was extracted successfully!")
             
 else:
-    # Welcome message - using a variable to avoid triple quote issues
-    welcome_text = """
-    ### 👋 Welcome!
-    
-    This tool extracts agency data directly from Homegate.ch URLs and provides an Excel file.
-    
-    **Features:**
-    - Same extraction logic as your original script
-    - No HTML files saved - just the Excel output
-    - Tracks captcha, gone URLs, and rate limiting
-    - Proxy support
-    
-    **How to use:**
-    1. Paste your URLs or upload a text file
-    2. Configure proxy settings (optional)
-    3. Click "Start Extraction"
-    4. Download your Excel file
-    
-    **Example URL:**
+    # Using multiple small markdown calls instead of one big string
+    st.markdown("### 👋 Welcome!")
+    st.markdown("")
+    st.markdown("This tool extracts agency data directly from Homegate.ch URLs and provides an Excel file.")
+    st.markdown("")
+    st.markdown("**Features:**")
+    st.markdown("- Same extraction logic as your original script")
+    st.markdown("- No HTML files saved - just the Excel output")
+    st.markdown("- Tracks captcha, gone URLs, and rate limiting")
+    st.markdown("- Proxy support")
+    st.markdown("")
+    st.markdown("**How to use:**")
+    st.markdown("1. Paste your URLs or upload a text file")
+    st.markdown("2. Configure proxy settings (optional)")
+    st.markdown("3. Click 'Start Extraction'")
+    st.markdown("4. Download your Excel file")
+    st.markdown("")
+    st.markdown("**Example URL:**")
+    st.code("https://www.homegate.ch/agency/abc123")
+    st.code("https://www.homegate.ch/agency/xyz789/company-name")
+
+st.markdown("---")
+st.markdown("⚡ Powered by your original extraction logic")
