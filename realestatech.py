@@ -250,8 +250,8 @@ if urls:
             st.error("❌ No data was extracted successfully!")
             
 else:
-    # Simple welcome message
-    st.markdown("""
+    # Simple welcome message - FIXED: properly closed triple quotes
+    welcome_message = """
     ### 👋 Welcome!
     
     Enter your Homegate agency URLs to extract data.
