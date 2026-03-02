@@ -1,207 +1,450 @@
 import streamlit as st
 from curl_cffi import requests
 import time
-import threading
 import random
-from pathlib import Path
-import os
 import json
+import re
+import pandas as pd
 from datetime import datetime
+import io
 
-# ----------------------------
-# SCRAPER CLASS
-# ----------------------------
+# Set page config
+st.set_page_config(
+    page_title="Homegate Agency Data Extractor",
+    page_icon="🏢",
+    layout="wide"
+)
 
-class FastHTMLScraper:
-
-    def __init__(self, urls, use_proxies=False, proxy_file="proxies.txt"):
-
+class HomegateExtractor:
+    def __init__(self, urls, proxies=None, max_retries=2):
         self.urls = urls
-        self.use_proxies = use_proxies
-        self.proxy_file = proxy_file
-
-        self.html_folder = Path("html_files")
-        self.html_folder.mkdir(exist_ok=True)
-
-        self.progress_file = "progress.txt"
-        self.processed_urls = self.load_progress()
-
-        self.proxies = self.load_proxies() if use_proxies else []
+        self.proxies = proxies if proxies else []
+        self.max_retries = max_retries
+        self.total_urls = len(urls)
         self.proxy_index = 0
-
-        self.running = True
-
-        # Stats
-        self.total = len(urls)
-        self.processed = len(self.processed_urls)
-        self.success = 0
-        self.failed = 0
-        self.gone = 0
-        self.captcha = 0
-
-    # ----------------------------
-
-    def load_proxies(self):
-        proxies = []
-        if os.path.exists(self.proxy_file):
-            with open(self.proxy_file, "r") as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith("#"):
-                        proxies.append(line)
-        return proxies
-
-    # ----------------------------
-
-    def load_progress(self):
-        processed = set()
-        if os.path.exists(self.progress_file):
-            with open(self.progress_file, "r") as f:
-                for line in f:
-                    processed.add(line.strip())
-        return processed
-
-    # ----------------------------
-
-    def save_progress(self, url):
-        with open(self.progress_file, "a") as f:
-            f.write(url + "\n")
-
-    # ----------------------------
-
-    def get_proxy(self):
+        self.results = []
+        self.failed_urls = []
+        self.stats = {
+            'success': 0,
+            'failed': 0,
+            'captcha_detected': 0,
+            'gone_count': 0,
+            'rate_limited': 0
+        }
+        
+    def get_next_proxy(self):
         if not self.proxies:
             return None
         proxy = self.proxies[self.proxy_index]
         self.proxy_index = (self.proxy_index + 1) % len(self.proxies)
-        return {"http": proxy, "https": proxy}
-
-    # ----------------------------
-
-    def check_captcha(self, text):
-        keywords = ["captcha", "cloudflare", "access denied", "robot"]
-        lower = text.lower()
-        return any(k in lower for k in keywords)
-
-    # ----------------------------
-
-    def download(self, url):
-
-        if not self.running:
-            return
-
-        filename = url.rstrip("/").split("/")[-1]
-        if not filename:
-            filename = "index.html"
-
-        filepath = self.html_folder / filename
-
-        if filepath.exists():
-            return
-
-        proxy = self.get_proxy() if self.use_proxies else None
-
+        return proxy
+    
+    def check_for_captcha(self, html_content):
+        """Check if page contains captcha indicators - matching original"""
+        captcha_indicators = [
+            'captcha', 'recaptcha', 'cf-challenge', 'cf-browser-verification',
+            'cf-ray', 'access denied', 'please verify', 'robot check',
+            'security check', 'captcha-delivery', 'turnstile', 'cloudflare',
+            'ddos-guard', 'bot detection', 'your request has been blocked',
+            'attention required', 'please complete the security check'
+        ]
+        
+        html_lower = html_content.lower()
+        for indicator in captcha_indicators:
+            if indicator in html_lower:
+                return True
+        return False
+    
+    def check_for_gone(self, html_content):
+        """Check if page indicates content is gone - matching original"""
+        gone_indicators = [
+            '410 gone', 'page not found', 'no longer available',
+            'has been removed', 'does not exist', '404 not found',
+            'error 404', 'error 410'
+        ]
+        
+        html_lower = html_content.lower()
+        for indicator in gone_indicators:
+            if indicator in html_lower:
+                return True
+        return False
+    
+    def extract_from_html(self, html_content, url):
+        """Extract company data from HTML - matching original extractor exactly"""
         try:
-            time.sleep(random.uniform(1, 2))
+            # Try JSON extraction first
+            pattern = r'window\.__INITIAL_STATE__\s*=\s*({.*?});'
+            match = re.search(pattern, html_content, re.DOTALL)
+            
+            if match:
+                json_str = match.group(1)
+                json_str = re.sub(r',\s*}', '}', json_str)
+                json_str = re.sub(r',\s*]', ']', json_str)
+                
+                # Find valid JSON end
+                stack = []
+                valid_end = 0
+                for i, char in enumerate(json_str):
+                    if char == '{':
+                        stack.append(char)
+                    elif char == '}':
+                        if stack:
+                            stack.pop()
+                            if not stack:
+                                valid_end = i + 1
+                                break
+                
+                if valid_end > 0:
+                    json_str = json_str[:valid_end]
+                
+                data = json.loads(json_str)
+                agency = data.get('agencyProfile', {}).get('agencyProfileFetch', {}).get('result', {})
+                
+                if agency:
+                    contact = agency.get('contact', {})
+                    address = agency.get('address', {})
+                    
+                    address_parts = []
+                    if address.get('street'):
+                        address_parts.append(address['street'])
+                    if address.get('postalCode') or address.get('city'):
+                        addr = f"{address.get('postalCode', '')} {address.get('city', '')}".strip()
+                        if addr:
+                            address_parts.append(addr)
+                    
+                    return {
+                        'company_name': agency.get('agencyName'),
+                        'address': ', '.join(address_parts) if address_parts else None,
+                        'phone': contact.get('phone') or agency.get('customPhoneNumber'),
+                        'email': contact.get('email'),
+                        'website': contact.get('website'),
+                        'logo_url': agency.get('logo'),
+                        'agency_id': agency.get('agencyId'),
+                        'source_url': url,
+                        'extract_method': 'json'
+                    }
+            
+            # Fallback extraction - matching original
+            name_match = re.search(r'<h1[^>]*>([^<]+)</h1>', html_content)
+            phone_match = re.search(r'tel:([^"]+)"', html_content) or re.search(r'phone":\s*"([^"]+)"', html_content)
+            email_match = re.search(r'mailto:([^"]+)"', html_content) or re.search(r'email":\s*"([^"]+)"', html_content)
+            address_match = re.search(r'<address[^>]*>([^<]+)</address>', html_content)
+            website_match = re.search(r'href="(https?://[^"]+)"[^>]*>Website', html_content)
+            logo_match = (re.search(r'<img[^>]*data-test="agencyLogoImage"[^>]*src="([^"]+)"', html_content) or 
+                         re.search(r'<img[^>]*class="[^"]*agency-logo[^"]*"[^>]*src="([^"]+)"', html_content))
+            
+            # Get filename for fallback name
+            filename = url.split('/')[-1] if url.split('/')[-1] else 'index'
+            
+            return {
+                'company_name': name_match.group(1).strip() if name_match else filename.replace('-', ' ').title(),
+                'address': address_match.group(1).strip() if address_match else None,
+                'phone': phone_match.group(1) if phone_match else None,
+                'email': email_match.group(1) if email_match else None,
+                'website': website_match.group(1) if website_match else None,
+                'logo_url': logo_match.group(1) if logo_match else None,
+                'agency_id': filename.split('_')[0] if '_' in filename else None,
+                'source_url': url,
+                'extract_method': 'fallback' if (name_match or phone_match or email_match) else 'minimal'
+            }
+            
+        except Exception as e:
+            return None
+    
+    def download_page(self, url):
+        """Download and extract data - matching original logic"""
+        for attempt in range(self.max_retries):
+            proxy_url = self.get_next_proxy() if self.proxies else None
+            proxy_dict = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+            
+            try:
+                headers = {
+                    'User-Agent': random.choice([
+                        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    ]),
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.5',
+                    'DNT': '1',
+                    'Connection': 'keep-alive',
+                    'Upgrade-Insecure-Requests': '1',
+                }
+                
+                time.sleep(random.uniform(1, 3))
+                
+                response = requests.get(
+                    url, 
+                    impersonate="chrome120", 
+                    timeout=30, 
+                    headers=headers,
+                    proxies=proxy_dict,
+                    verify=False
+                )
+                
+                # Handle 410 Gone
+                if response.status_code == 410:
+                    self.stats['gone_count'] += 1
+                    return None, "URL is gone (410)"
+                
+                # Handle other HTTP errors
+                if response.status_code != 200:
+                    if response.status_code in [403, 429, 503]:
+                        self.stats['rate_limited'] += 1
+                    return None, f"HTTP {response.status_code}"
+                
+                if response.status_code == 200:
+                    # Check if content is gone
+                    if self.check_for_gone(response.text):
+                        self.stats['gone_count'] += 1
+                        return None, "Content appears to be gone"
+                    
+                    # Check for captcha (just for stats)
+                    if self.check_for_captcha(response.text):
+                        self.stats['captcha_detected'] += 1
+                    
+                    # Extract data
+                    company_data = self.extract_from_html(response.text, url)
+                    if company_data:
+                        return company_data, None
+                    else:
+                        return None, "Failed to extract data"
+                    
+            except Exception as e:
+                if attempt == self.max_retries - 1:
+                    return None, str(e)[:100]
+                time.sleep(random.uniform(2, 4))
+        
+        return None, "Max retries exceeded"
+    
+    def run(self, progress_callback=None):
+        """Run the extractor"""
+        for i, url in enumerate(self.urls):
+            data, error = self.download_page(url)
+            
+            if data:
+                self.results.append(data)
+                self.stats['success'] += 1
+            else:
+                self.failed_urls.append({'url': url, 'error': error})
+                self.stats['failed'] += 1
+            
+            if progress_callback:
+                progress_callback(i + 1, self.total_urls, url, data is not None)
+        
+        return self.results, self.failed_urls, self.stats
 
-            response = requests.get(
-                url,
-                timeout=30,
-                proxies=proxy,
-                impersonate="chrome120"
-            )
+# Streamlit UI
+st.title("🏢 Homegate Agency Data Extractor")
+st.markdown("Extract agency data directly to Excel - no HTML files saved")
 
-            if response.status_code == 410:
-                self.gone += 1
-                self.save_progress(url)
-                return
-
-            if response.status_code != 200:
-                self.failed += 1
-                return
-
-            if self.check_captcha(response.text):
-                self.captcha += 1
-                return
-
-            with open(filepath, "w", encoding="utf-8") as f:
-                f.write(response.text)
-
-            self.success += 1
-            self.save_progress(url)
-
-        except:
-            self.failed += 1
-
-    # ----------------------------
-
-    def run(self, progress_bar, status_box):
-
-        for url in self.urls:
-
-            if not self.running:
-                break
-
-            if url in self.processed_urls:
-                continue
-
-            self.download(url)
-
-            self.processed += 1
-
-            progress = self.processed / self.total
-            progress_bar.progress(progress)
-
-            status_box.write(
-                f"""
-                Total: {self.total}
-                Processed: {self.processed}
-                Success: {self.success}
-                Failed: {self.failed}
-                Gone: {self.gone}
-                Captcha: {self.captcha}
-                """
-            )
-
-        status_box.write("✅ Finished!")
-
-# ----------------------------
-# STREAMLIT UI
-# ----------------------------
-
-st.title("🚀 Fast HTML Scraper")
-
-url_input = st.text_area("Paste URLs (one per line)")
-
-use_proxy = st.checkbox("Use Proxies")
-
-start_button = st.button("Start")
-stop_button = st.button("Stop")
-
-progress_bar = st.progress(0)
-status_box = st.empty()
-
-if "scraper" not in st.session_state:
-    st.session_state.scraper = None
-
-if start_button:
-
-    if not url_input.strip():
-        st.warning("Please enter URLs.")
-    else:
-        urls = [u.strip() for u in url_input.split("\n") if u.strip()]
-
-        scraper = FastHTMLScraper(urls, use_proxies=use_proxy)
-        st.session_state.scraper = scraper
-
-        thread = threading.Thread(
-            target=scraper.run,
-            args=(progress_bar, status_box),
-            daemon=True
+# Sidebar
+with st.sidebar:
+    st.header("⚙️ Settings")
+    
+    # Input method
+    input_method = st.radio(
+        "Choose input method:",
+        ["📝 Paste URLs", "📁 Upload file"]
+    )
+    
+    urls = []
+    if input_method == "📝 Paste URLs":
+        urls_text = st.text_area(
+            "Paste URLs (one per line):",
+            height=200,
+            placeholder="https://www.homegate.ch/agency/abc123\nhttps://www.homegate.ch/agency/xyz789"
         )
-        thread.start()
+        if urls_text:
+            urls = [u.strip() for u in urls_text.split('\n') if u.strip()]
+    else:
+        uploaded_file = st.file_uploader(
+            "Upload a text file with URLs",
+            type=['txt'],
+            help="Text file with one URL per line"
+        )
+        if uploaded_file:
+            content = uploaded_file.getvalue().decode('utf-8')
+            urls = [u.strip() for u in content.split('\n') if u.strip()]
+    
+    # Proxy settings
+    st.header("🔌 Proxy Settings")
+    proxy_option = st.radio(
+        "Proxy option:",
+        ["No proxy", "Use proxies"]
+    )
+    
+    proxies = []
+    if proxy_option == "Use proxies":
+        proxy_input = st.text_area(
+            "Enter proxies (one per line):",
+            height=150,
+            placeholder="http://user:pass@host:port\nhost:port:user:pass\nhost:port",
+            help="Supported formats:\n- http://user:pass@host:port\n- host:port:user:pass\n- host:port"
+        )
+        if proxy_input:
+            for line in proxy_input.split('\n'):
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    proxies.append(line)
+    
+    # Advanced settings
+    with st.expander("🔧 Advanced"):
+        max_retries = st.slider("Max retries per URL:", 1, 5, 2)
 
-if stop_button:
-    if st.session_state.scraper:
-        st.session_state.scraper.running = False
-        st.warning("Stopping...")
+# Main content
+if urls:
+    st.success(f"✅ Loaded {len(urls)} URLs")
+    
+    # Sample of URLs
+    with st.expander("📋 View URLs"):
+        for url in urls[:5]:
+            st.code(url)
+        if len(urls) > 5:
+            st.info(f"... and {len(urls) - 5} more")
+    
+    # Start button
+    col1, col2, col3 = st.columns([1, 1, 1])
+    with col2:
+        start_button = st.button("🚀 Start Extraction", type="primary", use_container_width=True)
+    
+    if start_button:
+        # Initialize extractor
+        extractor = HomegateExtractor(
+            urls=urls,
+            proxies=proxies if proxy_option == "Use proxies" else [],
+            max_retries=max_retries
+        )
+        
+        # Progress tracking
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        stats_text = st.empty()
+        log_container = st.container()
+        
+        def update_progress(current, total, current_url, success):
+            progress_bar.progress(current / total)
+            status_text.text(f"Processing: {current}/{total}")
+            stats_text.markdown(f"""
+            ✅ Success: {extractor.stats['success']} | ❌ Failed: {extractor.stats['failed']} | 📪 Gone: {extractor.stats['gone_count']} | ⚠️ Captcha: {extractor.stats['captcha_detected']}
+            """)
+            with log_container:
+                if success:
+                    st.success(f"✅ {current_url[:80]}...")
+                else:
+                    st.error(f"❌ {current_url[:80]}...")
+        
+        # Run extractor
+        with st.spinner("Extracting data..."):
+            results, failed, stats = extractor.run(progress_callback=update_progress)
+        
+        progress_bar.progress(1.0)
+        status_text.text("✅ Complete!")
+        
+        # Show summary
+        st.markdown("---")
+        col1, col2, col3, col4, col5 = st.columns(5)
+        with col1:
+            st.metric("Total URLs", len(urls))
+        with col2:
+            st.metric("Success", stats['success'])
+        with col3:
+            st.metric("Failed", stats['failed'])
+        with col4:
+            st.metric("Gone (410)", stats['gone_count'])
+        with col5:
+            st.metric("Captcha", stats['captcha_detected'])
+        
+        # Create Excel file
+        if results:
+            df = pd.DataFrame(results)
+            
+            # Reorder columns to match original
+            columns = ['company_name', 'source_url', 'logo_url', 'phone', 'email', 'website',
+                      'address', 'agency_id', 'extract_method']
+            existing_cols = [col for col in columns if col in df.columns]
+            other_cols = [col for col in df.columns if col not in columns]
+            df = df[existing_cols + other_cols]
+            
+            # Create Excel file in memory
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                df.to_excel(writer, index=False, sheet_name='Agencies')
+                
+                # Auto-adjust column widths
+                worksheet = writer.sheets['Agencies']
+                for column in worksheet.columns:
+                    max_length = 0
+                    column_letter = column[0].column_letter
+                    for cell in column:
+                        try:
+                            if len(str(cell.value)) > max_length:
+                                max_length = len(str(cell.value))
+                        except:
+                            pass
+                    adjusted_width = min(max_length + 2, 50)
+                    worksheet.column_dimensions[column_letter].width = adjusted_width
+            
+            output.seek(0)
+            
+            # Download button
+            st.markdown("### 📥 Download Results")
+            st.download_button(
+                label="📊 Download Excel File",
+                data=output,
+                file_name=f"homegate_agencies_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
+            
+            # Show data preview
+            with st.expander("👁️ Preview Extracted Data"):
+                st.dataframe(df[['company_name', 'phone', 'email', 'website', 'extract_method']].head(10), use_container_width=True)
+            
+            # Show failed URLs if any
+            if failed:
+                with st.expander("❌ Failed URLs"):
+                    failed_df = pd.DataFrame(failed)
+                    st.dataframe(failed_df, use_container_width=True)
+            
+            # Summary statistics
+            st.markdown("### 📊 Data Quality Summary")
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Companies with Phone", df['phone'].notna().sum())
+            with col2:
+                st.metric("Companies with Email", df['email'].notna().sum())
+            with col3:
+                st.metric("Companies with Website", df['website'].notna().sum())
+            with col4:
+                st.metric("Companies with Logo", df['logo_url'].notna().sum())
+            
+            # Extraction method breakdown
+            st.markdown("**Extraction Method:**")
+            method_counts = df['extract_method'].value_counts()
+            for method, count in method_counts.items():
+                st.markdown(f"- {method}: {count} ({count/len(df)*100:.1f}%)")
+            
+        else:
+            st.error("❌ No data was extracted successfully!")
+            
+else:
+    # Welcome message
+    st.markdown("""
+    ### 👋 Welcome!
+    
+    This tool extracts agency data directly from Homegate.ch URLs and provides an Excel file.
+    
+    **Features:**
+    - Same extraction logic as your original script
+    - No HTML files saved - just the Excel output
+    - Tracks captcha, gone URLs, and rate limiting
+    - Proxy support
+    
+    **How to use:**
+    1. Paste your URLs or upload a text file
+    2. Configure proxy settings (optional)
+    3. Click "Start Extraction"
+    4. Download your Excel file
+    
+    **Example URL:**
