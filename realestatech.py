@@ -51,6 +51,8 @@ class HomegateScraper:
         self.proxy_index = 0
         self.results = []
         self.failed_urls = []
+        self.success = 0
+        self.failed = 0
         
     def get_next_proxy(self):
         if not self.proxies:
